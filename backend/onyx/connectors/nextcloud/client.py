@@ -106,21 +106,21 @@ class NextcloudWebDAVClient:
     def list_files(
         self,
         path: str = "",
-        depth: str = "infinity",
+        depth: str = "1",
         modified_since: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """List files and directories in the specified path.
-        
+        """List files and directories in the specified path (single level).
+
         Args:
             path: Path relative to user's root directory
-            depth: WebDAV depth ('0', '1', or 'infinity')
+            depth: WebDAV depth ('0' or '1') - 'infinity' is not recommended
             modified_since: Only return files modified after this datetime
-            
+
         Returns:
             List of file/directory information dictionaries
         """
         url = urljoin(self.webdav_url, quote(path.lstrip("/")))
-        
+
         # Build PROPFIND request body to get file properties
         propfind_body = """<?xml version="1.0" encoding="UTF-8"?>
 <d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
@@ -144,23 +144,79 @@ class NextcloudWebDAVClient:
                 url,
                 data=propfind_body,
                 headers={"Depth": depth},
-                timeout=30,
+                timeout=60,
             )
             response.raise_for_status()
-            
-            logger.debug(f"WebDAV PROPFIND request successful")
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response length: {len(response.text)} characters")
-            logger.debug(f"Request URL: {url}")
-            
+
+            logger.debug(f"WebDAV PROPFIND request successful for path '{path}'")
+
             # Parse XML response
             files = self._parse_propfind_response(response.text, modified_since)
-            logger.debug(f"Parsed {len(files)} items from XML response")
+            logger.debug(f"Parsed {len(files)} items from path '{path}'")
             return files
-            
+
         except Exception as e:
             logger.error(f"Failed to list files at path '{path}': {e}")
             raise
+
+    def list_files_recursive(
+        self,
+        path: str = "",
+        modified_since: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Recursively list all files and directories.
+
+        Uses depth=1 requests to avoid timeout issues with large directories.
+
+        Args:
+            path: Path relative to user's root directory
+            modified_since: Only return files modified after this datetime
+
+        Returns:
+            List of file/directory information dictionaries
+        """
+        all_files: List[Dict[str, Any]] = []
+        directories_to_process = [path]
+        processed_dirs: set = set()
+
+        while directories_to_process:
+            current_path = directories_to_process.pop(0)
+
+            # Skip if already processed (avoid infinite loops)
+            if current_path in processed_dirs:
+                continue
+            processed_dirs.add(current_path)
+
+            try:
+                # List items in current directory (depth=1)
+                items = self.list_files(path=current_path, depth="1", modified_since=None)
+
+                for item in items:
+                    item_path = item.get('path', '')
+
+                    # Skip the directory itself (first item in response)
+                    if item_path.rstrip('/') == current_path.rstrip('/') or item_path == '/':
+                        continue
+
+                    if item.get('is_directory', False):
+                        # Queue subdirectory for processing
+                        directories_to_process.append(item_path)
+                        logger.debug(f"Queued directory for traversal: {item_path}")
+                    else:
+                        # Apply date filter if specified
+                        if modified_since and item.get('last_modified'):
+                            if item['last_modified'] < modified_since:
+                                continue
+                        all_files.append(item)
+
+                logger.info(f"Processed directory '{current_path}': found {len([i for i in items if not i.get('is_directory')])} files, {len([i for i in items if i.get('is_directory')])} subdirs. Total files so far: {len(all_files)}")
+
+            except Exception as e:
+                logger.warning(f"Failed to list directory '{current_path}': {e}. Continuing with other directories.")
+                continue
+
+        logger.info(f"Recursive listing complete. Total files found: {len(all_files)}")
+        return all_files
 
     def get_file_content(self, file_path: str) -> bytes:
         """Download file content.

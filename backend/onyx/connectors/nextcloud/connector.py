@@ -2,14 +2,17 @@
 Nextcloud connector for Onyx using WebDAV API.
 """
 
+import io
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from onyx.configs.constants import DocumentSource
 from onyx.connectors.interfaces import GenerateDocumentsOutput, LoadConnector, PollConnector
 from onyx.connectors.models import Document, TextSection
+from onyx.file_processing.extract_file_text import extract_text_and_images
 
 from .client import NextcloudWebDAVClient
 
@@ -33,17 +36,6 @@ class ConnectorMissingCredentialError(Exception):
     """Exception raised when connector credentials are missing or invalid."""
     pass
 
-def extract_file_text(file_content: bytes, file_path: str) -> str:
-    """Simple text extraction for common file types."""
-    try:
-        # For now, just handle plain text files
-        if file_path.lower().endswith(('.txt', '.md', '.py', '.js', '.css', '.html', '.htm', '.xml', '.json')):
-            return file_content.decode('utf-8', errors='ignore')
-        else:
-            # For other files, return basic info
-            return f"File: {file_path}\nSize: {len(file_content)} bytes"
-    except Exception:
-        return f"Could not extract text from {file_path}"
 
 def is_accepted_file_ext(file_path: str, accepted_extensions: set = None) -> bool:
     """Check if file extension is supported."""
@@ -97,11 +89,11 @@ class NextcloudConnector(LoadConnector, PollConnector):
         Returns:
             None
         """
-        self.server_url = credentials["server_url"]
-        self.username = credentials["username"] 
-        self.password = credentials["password"]
-        
-        # Optional configuration
+        self.server_url = credentials["nextcloud_server_url"]
+        self.username = credentials["nextcloud_username"]
+        self.password = credentials["nextcloud_password"]
+
+        # Optional configuration from connector config (not credentials)
         self.path_filter = credentials.get("path_filter", "")
         self.verify_ssl = credentials.get("verify_ssl", True)
         
@@ -165,117 +157,153 @@ class NextcloudConnector(LoadConnector, PollConnector):
         yield from self._get_all_documents(modified_since=start_datetime)
 
     def _get_all_documents(
-        self, 
+        self,
         modified_since: Optional[datetime] = None
     ) -> GenerateDocumentsOutput:
         """Get all documents, optionally filtered by modification date.
-        
+
+        Traverses directories incrementally and yields batches as files are found,
+        providing progress visibility for large Nextcloud instances.
+
         Args:
             modified_since: Only include files modified after this date
-            
+
         Yields:
             Batches of Document objects
         """
         try:
-            # Get list of all files
-            logger.info(f"Listing files from path: '{self.path_filter}' with WebDAV URL: {self.client.webdav_url}")
-            files = self.client.list_files(
-                path=self.path_filter,
-                depth="infinity", 
-                modified_since=modified_since,
-            )
-            
-            logger.debug(f"Found {len(files)} total items from WebDAV")
-            
-            # Filter to only include regular files (not directories)
-            regular_files = [f for f in files if not f.get('is_directory', False)]
-            logger.info(f"Found {len(regular_files)} regular files (excluding directories)")
-            
-            # Debug: Show first few files
-            for i, file_info in enumerate(regular_files[:5]):
-                logger.debug(f"  {i+1}. {file_info.get('path', 'no-path')} (size: {file_info.get('size', 'unknown')})")
-            
-            # Process files in batches
+            logger.info(f"Starting incremental traversal from path: '{self.path_filter}'")
+
             doc_batch: List[Document] = []
-            
-            for file_info in regular_files:
-                try:
-                    # Check if file type is supported
-                    if not self._is_supported_file(file_info):
-                        logger.debug(f"Skipping unsupported file: {file_info.get('path', 'unknown')}")
-                        continue
-                    
-                    logger.debug(f"Processing supported file: {file_info.get('path', 'unknown')}")
-                    
-                    # Create document from file
-                    document = self._create_document_from_file(file_info)
-                    if document:
-                        doc_batch.append(document)
-                        logger.debug(f"Created document: {document.semantic_identifier}")
-                        
-                        # Yield batch when it reaches the target size
-                        if len(doc_batch) >= self.batch_size:
-                            logger.info(f"Yielding batch of {len(doc_batch)} documents")
-                            yield doc_batch
-                            doc_batch = []
-                    else:
-                        logger.warning(f"Failed to create document for: {file_info.get('path', 'unknown')}")
-                            
-                except Exception as e:
-                    # Log error but continue processing other files
-                    logger.error(f"Error processing file {file_info.get('path', 'unknown')}: {e}")
+            directories_to_process = [self.path_filter]
+            processed_dirs: set = set()
+            total_files_found = 0
+            total_docs_created = 0
+
+            while directories_to_process:
+                current_path = directories_to_process.pop(0)
+
+                # Skip if already processed
+                if current_path in processed_dirs:
                     continue
-            
-            # Yield any remaining documents
+                processed_dirs.add(current_path)
+
+                try:
+                    # List items in current directory (depth=1 for reliability)
+                    items = self.client.list_files(path=current_path, depth="1")
+
+                    files_in_dir = 0
+                    subdirs_in_dir = 0
+
+                    for item in items:
+                        item_path = item.get('path', '')
+
+                        # Skip the directory itself
+                        if item_path.rstrip('/') == current_path.rstrip('/') or item_path == '/':
+                            continue
+
+                        if item.get('is_directory', False):
+                            directories_to_process.append(item_path)
+                            subdirs_in_dir += 1
+                        else:
+                            files_in_dir += 1
+                            total_files_found += 1
+
+                            # Apply date filter
+                            if modified_since and item.get('last_modified'):
+                                if item['last_modified'] < modified_since:
+                                    continue
+
+                            # Check if file type is supported
+                            if not self._is_supported_file(item):
+                                continue
+
+                            # Create document from file
+                            try:
+                                document = self._create_document_from_file(item)
+                                if document:
+                                    doc_batch.append(document)
+                                    total_docs_created += 1
+
+                                    # Yield batch when full
+                                    if len(doc_batch) >= self.batch_size:
+                                        logger.info(f"Yielding batch of {len(doc_batch)} docs (total: {total_docs_created} docs from {total_files_found} files, {len(processed_dirs)} dirs)")
+                                        yield doc_batch
+                                        doc_batch = []
+                            except Exception as e:
+                                logger.error(f"Error processing file {item_path}: {e}")
+                                continue
+
+                    logger.info(f"Dir '{current_path}': {files_in_dir} files, {subdirs_in_dir} subdirs. Queue: {len(directories_to_process)}. Total: {total_files_found} files, {total_docs_created} docs")
+
+                except Exception as e:
+                    logger.warning(f"Failed to list '{current_path}': {e}. Continuing...")
+                    continue
+
+            # Yield remaining documents
             if doc_batch:
-                logger.info(f"Yielding final batch of {len(doc_batch)} documents")
+                logger.info(f"Yielding final batch of {len(doc_batch)} docs (total: {total_docs_created} from {total_files_found} files)")
                 yield doc_batch
-            else:
-                logger.info("No documents to yield - empty batch")
-                
+
+            logger.info(f"Traversal complete: {len(processed_dirs)} dirs, {total_files_found} files, {total_docs_created} docs indexed")
+
         except Exception as e:
             logger.error(f"Error getting documents from Nextcloud: {e}")
             raise
 
     def _create_document_from_file(self, file_info: Dict[str, Any]) -> Optional[Document]:
         """Create a Document object from Nextcloud file information.
-        
+
+        Uses Onyx's extract_text_and_images for proper extraction from
+        PDFs, DOCs, and other file formats.
+
         Args:
             file_info: File information dictionary from WebDAV response
-            
+
         Returns:
             Document object or None if creation fails
         """
         try:
             file_path = file_info.get('path', '')
-            file_name = file_info.get('name', file_path.split('/')[-1])
-            
+            file_name = file_info.get('name') or file_path.split('/')[-1]
+
             # Get file content
             try:
                 file_content = self.client.get_file_content(file_path)
-                
-                # Extract text content from file
-                extracted_text = extract_file_text(
-                    file_content=file_content,
-                    file_path=file_path,
+
+                # Use Onyx's file processing for proper text extraction (PDF, DOC, etc.)
+                file_obj = io.BytesIO(file_content)
+                extraction_result = extract_text_and_images(
+                    file=file_obj,
+                    file_name=file_name,
                 )
-                
-                if not extracted_text:
+
+                extracted_text = extraction_result.text_content
+
+                if not extracted_text or not extracted_text.strip():
+                    logger.debug(f"No text extracted from {file_path}")
                     return None
-                    
+
             except Exception as e:
                 logger.warning(f"Failed to extract content from {file_path}: {e}")
                 return None
-            
+
             # Create document sections
+            file_id = file_info.get('file_id', '')
             sections = [TextSection(
-                link=self._build_file_url(file_path),
+                link=self._build_file_url(file_path, file_id),
                 text=extracted_text,
             )]
-            
+
             # Build metadata
             metadata = self._build_metadata(file_info)
-            
+
+            # Add any metadata from the extraction (e.g., PDF metadata)
+            if extraction_result.metadata:
+                for key, value in extraction_result.metadata.items():
+                    if key not in metadata:
+                        metadata[key] = str(value)
+
             # Create document
             document = Document(
                 id=f"nextcloud_{file_info.get('file_id', file_path)}",
@@ -285,29 +313,36 @@ class NextcloudConnector(LoadConnector, PollConnector):
                 doc_updated_at=file_info.get('last_modified'),
                 metadata=metadata,
             )
-            
+
             return document
-            
+
         except Exception as e:
             logger.error(f"Error creating document from file {file_info.get('path', 'unknown')}: {e}")
             return None
 
-    def _build_file_url(self, file_path: str) -> str:
+    def _build_file_url(self, file_path: str, file_id: str = "") -> str:
         """Build a URL to view the file in Nextcloud web interface.
-        
+
         Args:
             file_path: Path to the file
-            
+            file_id: Nextcloud file ID (from WebDAV oc:fileid)
+
         Returns:
-            Web URL for the file
+            Web URL for the file (properly URL-encoded)
         """
         # Ensure the path starts with a slash
         if not file_path.startswith('/'):
             file_path = '/' + file_path
-        
-        # Use the direct file access URL format for Nextcloud
-        # This should work for most Nextcloud installations
-        return f"{self.server_url}/index.php/apps/files/?dir={os.path.dirname(file_path)}&openfile={os.path.basename(file_path)}"
+
+        # URL-encode the directory path to handle spaces and special chars
+        dir_path = quote(os.path.dirname(file_path), safe='/')
+
+        # Nextcloud URL format: /apps/files/files/{file_id}?dir=...&editing=false&openfile=true
+        if file_id:
+            return f"{self.server_url}/apps/files/files/{file_id}?dir={dir_path}&editing=false&openfile=true"
+        else:
+            # Fallback without file_id (won't open the file directly)
+            return f"{self.server_url}/apps/files/?dir={dir_path}&editing=false&openfile=true"
 
     def _build_metadata(self, file_info: Dict[str, Any]) -> Dict[str, str]:
         """Build metadata dictionary from file information.
